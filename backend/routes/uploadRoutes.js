@@ -1,15 +1,12 @@
-const express = require('express');
-const router = express.Router();
-const { handleUpload, healthCheck } = require('../controllers/uploadController.js');
-const { uploadLimiter } = require('../middleware/rateLimiter.js');
+const express = require('express')
+const router = express.Router()
+const { handleUpload, healthCheck } = require('../controllers/uploadController')
+const { getHistory, deleteHistory } = require('../controllers/historyController')
+const { uploadLimiter } = require('../middleware/rateLimiter')
 
-// ─── Health Check ────────────────────────────────────────────────
-// GET /api/health
-router.get('/health', healthCheck);
+router.get('/health', healthCheck)
+router.post('/upload', uploadLimiter, handleUpload)
+router.get('/history', getHistory)
+router.delete('/history', deleteHistory)
 
-// ─── Main Upload Route ───────────────────────────────────────────
-// POST /api/upload
-// Body: { driveLink: "https://drive.google.com/..." }
-router.post('/upload', uploadLimiter, handleUpload);
-
-module.exports = router;
+module.exports = router

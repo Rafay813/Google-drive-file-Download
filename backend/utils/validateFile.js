@@ -8,16 +8,17 @@ const { createError } = require('./errorHandler');
  */
 const validateFile = (filename, size, mimeType) => {
 
-  // ─── 1. Check file size ──────────────────────────────────────
-  if (size && size > config.maxFileSizeBytes) {
-    const sizeMB = (size / 1024 / 1024).toFixed(2);
-    const maxMB = (config.maxFileSizeBytes / 1024 / 1024).toFixed(0);
-    throw createError(
-      `File size ${sizeMB}MB exceeds maximum allowed size of ${maxMB}MB`,
-      413
-    );
-  }
-
+  // // ─── 1. Check file size ──────────────────────────────────────
+  // if (size && size > config.maxFileSizeBytes) {
+  //   const sizeMB = (size / 1024 / 1024).toFixed(2);
+  //   const maxMB = (config.maxFileSizeBytes / 1024 / 1024).toFixed(0);
+  //   throw createError(
+  //     `File size ${sizeMB}MB exceeds maximum allowed size of ${maxMB}MB`,
+  //     413
+  //   );
+  // }
+// No file size limit
+console.log(`📦 File size: ${(size / 1024 / 1024).toFixed(2)} MB — allowed`)
   // ─── 2. Check file type ──────────────────────────────────────
   const cleanMime = mimeType ? mimeType.split(';')[0].trim() : '';
   if (cleanMime && !config.allowedMimeTypes.includes(cleanMime)) {
@@ -33,10 +34,11 @@ const validateFile = (filename, size, mimeType) => {
   }
 
   // ─── 4. Sanitize filename ────────────────────────────────────
-  const sanitized = filename
-    ? filename.replace(/[^a-zA-Z0-9._\-\s]/g, '_').trim()
-    : 'unknown_file';
+ const sanitized = filename
+  ? filename.trim()
+  : 'unknown_file'
 
+return sanitized
   return sanitized;
 };
 

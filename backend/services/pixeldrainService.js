@@ -1,7 +1,6 @@
 const axios = require('axios');
-const FormData = require('form-data');
 const config = require('../config/env');
-const { createError } = require('../utils/errorHandler.js');
+const { createError } = require('../utils/errorHandler'); // ← was missing!
 
 const uploadToPixelDrain = async (fileStream, filename, mimeType) => {
   try {
@@ -16,10 +15,16 @@ const uploadToPixelDrain = async (fileStream, filename, mimeType) => {
         headers: {
           Authorization: `Basic ${authToken}`,
           'Content-Type': mimeType || 'application/octet-stream',
+          'Connection': 'keep-alive',
         },
         maxContentLength: Infinity,
         maxBodyLength: Infinity,
-        timeout: 300000,
+        timeout: 0,
+        httpsAgent: new (require('https').Agent)({
+          keepAlive: true,
+          keepAliveMsecs: 30000,
+          timeout: 0,
+        }),
       }
     );
 
@@ -42,7 +47,6 @@ const uploadToPixelDrain = async (fileStream, filename, mimeType) => {
       const status = err.response.status;
       if (status === 401) throw createError('PixelDrain API key is invalid', 401);
       if (status === 413) throw createError('File too large for PixelDrain', 413);
-      if (status === 422) throw createError('PixelDrain rejected the file', 422);
     }
     throw createError(`PixelDrain upload failed: ${err.message}`, 502);
   }

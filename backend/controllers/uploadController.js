@@ -1,126 +1,195 @@
-const { getDriveFileStream, getDriveFileMetadata } = require('../services/gDrive.js');
-const { uploadToGofile } = require('../services/gofileService.js');
-const { uploadToPixelDrain } = require('../services/pixeldrainService.js');
-const extractDriveId = require('../utils/extractDriveId.js');
-const { createError } = require('../utils/errorHandler.js');
-const { sanitizeDriveLink } = require('../utils/sanitize.js');
-const validateFile = require('../utils/validateFile.js');
-const { PassThrough } = require('stream');
+const { getDriveFileStream, getDriveFileMetadata } = require('../services/gDrive.js')
+const { getDirectFileMetadata, getDirectFileStream, getMediaFireStream } = require('../services/directService.js')
+const { uploadToGofile } = require('../services/gofileService.js')
+const { uploadToPixelDrain } = require('../services/pixeldrainService.js')
+const { detectSource } = require('../utils/detectSource.js')
+const { createError } = require('../utils/errorHandler.js')
+const validateFile = require('../utils/validateFile.js')
+const { PassThrough } = require('stream')
+const Transfer = require('../models/Transfer.js')
 
 const handleUpload = async (req, res, next) => {
   try {
-    const { driveLink } = req.body;
+    const { driveLink } = req.body
+    const clientIp = req.ip || req.connection.remoteAddress
 
-    // ─── 1. Sanitize input ───────────────────────────────────────
-    const sanitizedLink = sanitizeDriveLink(driveLink);
-    if (!sanitizedLink) {
-      throw createError(
-        'Invalid Google Drive URL. Make sure it starts with https://drive.google.com',
-        400
-      );
+    if (!driveLink || typeof driveLink !== 'string') {
+      throw createError('Please provide a valid download link.', 400)
     }
 
-    // ─── 2. Extract file ID ──────────────────────────────────────
-    const fileId = extractDriveId(sanitizedLink);
-    if (!fileId) {
-      throw createError(
-        'Could not extract file ID. Make sure the link is a valid public Google Drive link.',
-        400
-      );
+    const trimmedLink = driveLink.trim()
+    if (!trimmedLink.startsWith('http://') && !trimmedLink.startsWith('https://')) {
+      throw createError('Link must start with http:// or https://', 400)
     }
 
-    console.log(`\n🔗 Processing Drive File ID: ${fileId}`);
+    const detected = detectSource(trimmedLink)
+    if (!detected) {
+      throw createError('Could not process this link.', 400)
+    }
 
-    // ─── 3. Get file metadata ────────────────────────────────────
-    console.log('📋 Fetching file metadata...');
-    const metadata = await getDriveFileMetadata(fileId);
-    console.log(`📁 File: ${metadata.filename} | Size: ${(metadata.size / 1024 / 1024).toFixed(2)} MB | Type: ${metadata.mimeType}`);
+    console.log(`\n🔗 Source: ${detected.source.toUpperCase()}`)
+    console.log(`📎 URL: ${detected.url}`)
 
-    // ─── 4. Validate file (size + type) ─────────────────────────
-    const safeFilename = validateFile(metadata.filename, metadata.size, metadata.mimeType);
-    metadata.filename = safeFilename;
+    console.log('📋 Fetching file metadata...')
+    let metadata
 
-    // ─── 5. Get file stream from Google Drive ────────────────────
-    console.log('⬇️  Streaming file from Google Drive...');
-    const { stream: driveStream } = await getDriveFileStream(fileId);
+    if (detected.source === 'googledrive') {
+      metadata = await getDriveFileMetadata(detected.fileId)
+    } else {
+      metadata = await getDirectFileMetadata(detected.url)
+    }
 
-    // ─── 6. Split stream into two PassThrough streams ────────────
-    const gofilePassThrough = new PassThrough();
-    const pixeldrainPassThrough = new PassThrough();
+    const fileSizeMB = (metadata.size / 1024 / 1024).toFixed(2)
+    const fileSizeGB = (metadata.size / 1024 / 1024 / 1024).toFixed(2)
+    console.log(`📁 File: ${metadata.filename}`)
+    console.log(`📦 Size: ${fileSizeMB} MB (${fileSizeGB} GB)`)
+    console.log(`🎭 Type: ${metadata.mimeType}`)
 
-    let streamError = null;
+    const safeFilename = validateFile(metadata.filename, metadata.size, metadata.mimeType)
+    metadata.filename = safeFilename
 
-    driveStream.on('data', (chunk) => {
-      const canWriteGofile = gofilePassThrough.write(chunk);
-      const canWritePixel = pixeldrainPassThrough.write(chunk);
+    console.log('\n⬇️  Starting file stream...')
+    let streamResult
 
-      // Backpressure handling — pause if buffer is full
-      if (!canWriteGofile || !canWritePixel) {
-        driveStream.pause();
+    if (detected.source === 'googledrive') {
+      // ── Pass mimeType so Google Workspace files get exported correctly ──
+      streamResult = await getDriveFileStream(detected.fileId, metadata.mimeType)
+
+      // If it was exported, update metadata to reflect the new format
+      if (streamResult.exportExt && streamResult.exportMime) {
+        const baseName = metadata.filename.replace(/\.[^/.]+$/, '') || metadata.filename
+        metadata.filename = `${baseName}${streamResult.exportExt}`
+        metadata.mimeType = streamResult.exportMime
+        console.log(`📝 Exported filename: ${metadata.filename}`)
+        console.log(`📝 Exported mimeType: ${metadata.mimeType}`)
       }
-    });
+    } else if (detected.source === 'mediafire') {
+      streamResult = await getMediaFireStream(detected.url)
+    } else {
+      streamResult = await getDirectFileStream(detected.url)
+    }
 
-    gofilePassThrough.on('drain', () => driveStream.resume());
-    pixeldrainPassThrough.on('drain', () => driveStream.resume());
+    const { stream: sourceStream } = streamResult
 
-    driveStream.on('end', () => {
-      gofilePassThrough.end();
-      pixeldrainPassThrough.end();
-    });
+    let bytesStreamed = 0
+    let lastLoggedMB = 0
+    const totalMB = parseFloat(fileSizeMB)
+    const logIntervalMB = totalMB > 500 ? 50 : totalMB > 100 ? 20 : 10
 
-    driveStream.on('error', (err) => {
-      streamError = err;
-      gofilePassThrough.destroy(err);
-      pixeldrainPassThrough.destroy(err);
-    });
+    const gofilePassThrough = new PassThrough({ highWaterMark: 64 * 1024 * 1024 })
+    const pixeldrainPassThrough = new PassThrough({ highWaterMark: 64 * 1024 * 1024 })
 
-    // ─── 7. Upload to both services in parallel ──────────────────
-    console.log('📤 Uploading to Gofile and PixelDrain in parallel...');
+    sourceStream.on('data', (chunk) => {
+      bytesStreamed += chunk.length
+      const streamedMB = bytesStreamed / 1024 / 1024
+
+      if (streamedMB - lastLoggedMB >= logIntervalMB) {
+        lastLoggedMB = Math.floor(streamedMB / logIntervalMB) * logIntervalMB
+        const percent = totalMB > 0 ? ((streamedMB / totalMB) * 100).toFixed(1) : '?'
+        console.log(`📡 Streaming: ${streamedMB.toFixed(1)} MB / ${fileSizeMB} MB (${percent}%)`)
+      }
+
+      const canWriteGofile = gofilePassThrough.write(chunk)
+      const canWritePixel = pixeldrainPassThrough.write(chunk)
+
+      if (!canWriteGofile || !canWritePixel) sourceStream.pause()
+    })
+
+    gofilePassThrough.on('drain', () => sourceStream.resume())
+    pixeldrainPassThrough.on('drain', () => sourceStream.resume())
+
+    sourceStream.on('end', () => {
+      const totalStreamed = (bytesStreamed / 1024 / 1024).toFixed(2)
+      console.log(`\n✅ Stream complete! Total: ${totalStreamed} MB`)
+      gofilePassThrough.end()
+      pixeldrainPassThrough.end()
+    })
+
+    sourceStream.on('error', (err) => {
+      console.error(`❌ Stream error: ${err.message}`)
+      gofilePassThrough.destroy(err)
+      pixeldrainPassThrough.destroy(err)
+    })
+
+    console.log('\n📤 Uploading to Gofile and PixelDrain in parallel...')
+    console.log('⏳ This may take several minutes for large files...\n')
 
     const [gofileResult, pixeldrainResult] = await Promise.allSettled([
       uploadToGofile(gofilePassThrough, metadata.filename, metadata.mimeType),
       uploadToPixelDrain(pixeldrainPassThrough, metadata.filename, metadata.mimeType),
-    ]);
+    ])
 
-    // ─── 8. Process results ──────────────────────────────────────
-    const results = [];
-    const errors = [];
+    const results = []
+    const errors = []
+
+    let gofileLink = null
+    let gofileFileId = null
+    let pixeldrainLink = null
+    let pixeldrainFileId = null
 
     if (gofileResult.status === 'fulfilled') {
-      results.push(gofileResult.value);
+      results.push(gofileResult.value)
+      gofileLink = gofileResult.value.downloadLink
+      gofileFileId = gofileResult.value.fileId
+      console.log(`✅ Gofile: ${gofileLink}`)
     } else {
-      console.error(`❌ Gofile failed: ${gofileResult.reason.message}`);
-      errors.push({ service: 'Gofile', error: gofileResult.reason.message });
+      console.error(`❌ Gofile failed: ${gofileResult.reason.message}`)
+      errors.push({ service: 'Gofile', error: gofileResult.reason.message })
     }
 
     if (pixeldrainResult.status === 'fulfilled') {
-      results.push(pixeldrainResult.value);
+      results.push(pixeldrainResult.value)
+      pixeldrainLink = pixeldrainResult.value.downloadLink
+      pixeldrainFileId = pixeldrainResult.value.fileId
+      console.log(`✅ PixelDrain: ${pixeldrainLink}`)
     } else {
-      console.error(`❌ PixelDrain failed: ${pixeldrainResult.reason.message}`);
-      errors.push({ service: 'PixelDrain', error: pixeldrainResult.reason.message });
+      console.error(`❌ PixelDrain failed: ${pixeldrainResult.reason.message}`)
+      errors.push({ service: 'PixelDrain', error: pixeldrainResult.reason.message })
     }
 
-    // ─── 9. If both failed ────────────────────────────────────────
     if (results.length === 0) {
-      throw createError('Upload failed on all services. Please try again.', 502);
+      throw createError('Upload failed on all services. Please try again.', 502)
     }
 
-    // ─── 10. Success response ─────────────────────────────────────
-    console.log(`✅ Done! ${results.length} upload(s) successful.\n`);
+    try {
+      const transfer = new Transfer({
+        originalLink: trimmedLink,
+        source: detected.source,
+        fileId: detected.fileId || null,
+        filename: metadata.filename,
+        fileSize: `${fileSizeMB} MB`,
+        mimeType: metadata.mimeType,
+        gofileLink,
+        gofileFileId,
+        pixeldrainLink,
+        pixeldrainFileId,
+        uploadedByIp: clientIp,
+        gofileLastRefreshed: new Date(),
+        gofileNextRefresh: new Date(Date.now() + 10 * 24 * 60 * 60 * 1000),
+      })
+
+      await transfer.save()
+      console.log(`💾 Saved to MongoDB: ${transfer._id}`)
+    } catch (dbErr) {
+      console.error(`⚠️  MongoDB save failed: ${dbErr.message}`)
+    }
+
+    console.log(`\n🎉 Done! ${results.length} upload(s) successful!`)
 
     return res.status(200).json({
       success: true,
       message: `File uploaded successfully to ${results.length} service(s).`,
+      source: detected.source,
       filename: metadata.filename,
-      fileSize: `${(metadata.size / 1024 / 1024).toFixed(2)} MB`,
+      fileSize: `${fileSizeMB} MB`,
       links: results,
       ...(errors.length > 0 && { warnings: errors }),
-    });
+    })
 
   } catch (err) {
-    next(err);
+    next(err)
   }
-};
+}
 
 const healthCheck = (req, res) => {
   res.status(200).json({
@@ -128,7 +197,7 @@ const healthCheck = (req, res) => {
     message: '🟢 Server is running',
     timestamp: new Date().toISOString(),
     version: '2.0.0',
-  });
-};
+  })
+}
 
-module.exports = { handleUpload, healthCheck };
+module.exports = { handleUpload, healthCheck }
