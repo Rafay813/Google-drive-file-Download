@@ -1,3 +1,6 @@
 node_modules/
 .env
 logs/*.log
+get_token.js
+echo "get_token.js" >> .gitignore
+echo "backend/get_token.js" >> .gitignore

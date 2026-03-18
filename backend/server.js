@@ -1,3 +1,17 @@
+// ✅ EPIPE guard — must be first line before anything else
+process.on('uncaughtException', (err) => {
+  if (err.code === 'EPIPE') {
+    console.warn('⚠️ Global EPIPE suppressed');
+    return;
+  }
+  console.error('❌ Uncaught Exception:', err);
+  throw err;
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('❌ Unhandled Rejection:', reason);
+});
+
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -15,7 +29,7 @@ const { startRefreshJob } = require('./jobs/refreshJob');
 const app = express();
 
 // ─── Connect MongoDB ─────────────────────────────────────────────
-connectDB().catch((err) => {
+connectDB().catch(() => {
   console.log('⚠️  DB connection issue — server continues without DB');
 });
 
@@ -34,24 +48,29 @@ app.disable('x-powered-by');
 
 // ─── CORS ────────────────────────────────────────────────────────
 const allowedOrigins = [
-  'http://localhost:5173',
+  'http://localhost:5174',
   'http://localhost:3000',
+  'https://myfrontend-drab.vercel.app',
   process.env.ALLOWED_ORIGIN,
 ].filter(Boolean);
 
-app.use(cors({
-  origin: (origin, callback) => {
+const corsOptions = {
+  origin: function (origin, callback) {
     if (!origin) return callback(null, true);
     if (allowedOrigins.includes(origin)) return callback(null, true);
-    callback(new Error(`CORS blocked: ${origin}`));
+    return callback(new Error(`CORS blocked: ${origin}`));
   },
-  methods: ['GET', 'POST'],
-  allowedHeaders: ['Content-Type'],
-}));
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+};
+
+app.use(cors(corsOptions));
 
 // ─── Body Parser ─────────────────────────────────────────────────
-app.use(express.json({ limit: '10kb' }));
-app.use(express.urlencoded({ extended: true, limit: '10kb' }));
+// ✅ Fixed: was 10kb — too small, caused parse errors on some requests
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // ─── Logger ──────────────────────────────────────────────────────
 app.use(morgan('dev'));
@@ -63,16 +82,28 @@ app.use('/api', apiLimiter);
 // ─── Routes ──────────────────────────────────────────────────────
 app.use('/api', uploadRoutes);
 
+// ─── Health Check ────────────────────────────────────────────────
+app.get('/api/health', (req, res) => {
+  res.json({
+    success: true,
+    message: '🟢 API is working',
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // ─── 404 ─────────────────────────────────────────────────────────
 app.use((req, res) => {
-  res.status(404).json({ success: false, message: `Route ${req.method} ${req.originalUrl} not found` });
+  res.status(404).json({
+    success: false,
+    message: `Route ${req.method} ${req.originalUrl} not found`,
+  });
 });
 
 // ─── Error Handler ───────────────────────────────────────────────
 app.use(errorHandler);
 
 // ─── Start Server ────────────────────────────────────────────────
-app.listen(config.port, () => {
+const server = app.listen(config.port, '0.0.0.0', () => {
   console.log('');
   console.log('╔══════════════════════════════════════╗');
   console.log(`║   🚀 Server running on port ${config.port}      ║`);
@@ -81,9 +112,12 @@ app.listen(config.port, () => {
   console.log('');
   console.log('📡 Routes: GET /api/health | POST /api/upload');
   console.log('');
-
-  // ─── Start Gofile Refresh Cron Job ───────────────────────────
   startRefreshJob();
 });
+
+// ✅ Keep connection alive for large file transfers
+server.keepAliveTimeout = 3600000; // 1 hour
+server.headersTimeout   = 3601000; // slightly more than keepAliveTimeout
+server.timeout          = 0;       // no request timeout
 
 module.exports = app;
